@@ -5,3 +5,9 @@ ckpt
 *.DS_Store
 
 *.safetensors
+
+# Generated audio files
+*.wav
+
+# Claude Code configuration
+.claude/
