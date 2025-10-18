@@ -1,0 +1,597 @@
+# CLAUDE.md
+
+このファイルは、Claude Code (claude.ai/code) がこのリポジトリで作業する際のガイダンスを提供します。
+
+## プロジェクト概要
+
+**TaDiCodec** (Text-aware Diffusion Speech Tokenizer) は、音声言語モデリングのための拡散ベースの音声トークナイザーです（NeurIPS 2025採択）。PyTorchによる研究実装を提供します。
+
+### 主な特徴
+
+1. **超低ビットレート圧縮**: 24kHz音声を0.0875kbps（87.5bps）で圧縮
+2. **テキスト認識型デコーディング**: テキスト情報を活用して音声品質を向上
+3. **ゼロショットTTS**: 事前学習済みモデルによる音声合成
+
+### リポジトリの内容
+
+- TaDiCodecトークナイザーの実装
+- ゼロショットTTSモデル（自己回帰型とMGM型）
+- 学習インフラ（開発中）
+- Hugging Faceからの自動ダウンロード機能付き事前学習済みモデル
+
+## 技術詳細
+
+### 1. 超低ビットレート (0.0875 kbps) の実現方法
+
+TaDiCodecは以下の技術により業界最低レベルのビットレートを実現しています：
+
+#### フレームレート 6.25Hz
+
+```python
+# 設定ファイル: egs/tts/TaDiCodec/tadicodec_6_25hz_16384_bsq.json
+サンプリングレート: 24000 Hz
+hop_size: 480 サンプル
+→ メルスペクトログラムのフレームレート = 24000 / 480 = 50 Hz
+
+down_sample_factor: 8
+→ VQコードのフレームレート = 50 / 8 = 6.25 Hz
+```
+
+**実装箇所** (`models/tts/tadicodec/modeling_tadicodec.py:314-320`):
+```python
+# エンコーダー出力をダウンサンプリング
+vq_emb_pre = vq_emb_pre.transpose(1, 2)
+vq_emb_pre = F.interpolate(
+    vq_emb_pre, size=T // self.down_sample_factor, mode="linear"
+)
+vq_emb_pre = vq_emb_pre.transpose(1, 2)
+```
+
+#### ビットレート計算
+
+```
+VQ次元: 14ビット (vq_emb_dim=14)
+コードブックサイズ: 2^14 = 16384 個
+フレームレート: 6.25 Hz
+
+ビットレート = 14 bits/frame × 6.25 frames/second = 87.5 bps = 0.0875 kbps
+```
+
+#### Binary Spherical Quantization (BSQ)
+
+**実装** (`models/codec/amphion_codec/quantize/bsq.py:150-367`):
+
+BSQは従来のベクトル量子化とは異なる革新的な手法：
+
+1. **2値化**: 各次元を{-1, 1}に量子化
+   ```python
+   # models/codec/amphion_codec/quantize/bsq.py:210-215
+   zhat = torch.where(
+       z > 0,
+       torch.tensor(1, dtype=z.dtype, device=z.device),
+       torch.tensor(-1, dtype=z.dtype, device=z.device),
+   )
+   return z + (zhat - z).detach()  # Straight-through estimator
+   ```
+
+2. **超球面上での量子化**: L2正規化により単位超球面上で量子化
+   ```python
+   # models/tts/tadicodec/modeling_tadicodec.py:324
+   vq_emb_pre = F.normalize(vq_emb_pre, dim=-1)
+   ```
+
+3. **エントロピー損失**: コードブックの均等利用を促進
+   ```python
+   # Soft entropy loss (bsq.py:265-297)
+   per_sample_entropy = ...  # 各サンプルのエントロピーを最大化
+   codebook_entropy = ...    # コードブック全体のエントロピーを最大化
+   entropy_penalty = gamma0 * per_sample_entropy - gamma * codebook_entropy
+   ```
+
+4. **コミットメント損失**: 量子化前後の表現を近づける
+   ```python
+   commit_loss = torch.mean(((zq.detach() - z) ** 2).sum(dim=-1))
+   ```
+
+### 2. テキスト認識機能の実装
+
+TaDiCodecの特徴的な機能として、デコーダーにテキスト情報を条件として与えます。
+
+#### テキスト埋め込み
+
+**実装** (`models/tts/tadicodec/modeling_tadicodec.py:178-180`):
+```python
+if self.use_text_cond:
+    self.text_emb = nn.Embedding(text_vocab_size, hidden_size)
+    # 語彙サイズ: 32100、埋め込み次元: 1024
+```
+
+#### デコーダーでのテキスト条件付け
+
+**フロー** (`modeling_tadicodec.py:352-362`):
+```python
+# 学習時
+if self.use_text_cond:
+    text_emb = self.text_emb(text_ids)  # テキストを埋め込みに変換
+else:
+    text_emb = None
+
+# VQ埋め込みを主条件として使用
+cond_emb = vq_emb_post
+# Classifier-Free Guidanceのための条件ドロップアウト
+if torch.rand(1) < self.cond_drop_p:  # cond_drop_p = 0.2
+    cond_emb = torch.zeros_like(cond_emb)
+```
+
+**デコーダーへの入力** (`modeling_tadicodec.py:377-384`):
+```python
+flow_pred = self.decoder(
+    x=xt,                      # ノイズを加えたメルスペクトログラム
+    x_mask=x_mask,             # パディングマスク
+    text_embedding=text_emb,   # テキスト埋め込み
+    text_mask=text_mask,       # テキストのマスク
+    cond=cond_emb,            # VQコード埋め込み
+    diffusion_step=new_t,     # 拡散ステップ
+)
+```
+
+#### Classifier-Free Guidance (CFG)
+
+**推論時の実装** (`modeling_tadicodec.py:564-593`):
+```python
+# 条件付き予測
+flow_pred = self.decoder(
+    x=xt_input,
+    text_embedding=text_emb,
+    cond=cond_emb,
+    diffusion_step=t,
+)
+
+# 無条件予測（テキストとコードをドロップ）
+uncond_flow_pred = self.decoder(
+    x=xt_input,
+    text_embedding=None,                    # テキストなし
+    cond=torch.zeros_like(cond_emb),       # コードなし
+    diffusion_step=t,
+)
+
+# CFGで組み合わせ
+flow_pred_cfg = uncond_flow_pred + cfg * (flow_pred - uncond_flow_pred)
+# cfg=2.0 の場合、条件付き予測の影響を2倍に強調
+
+# 再スケーリング（Stable Diffusion方式）
+if rescale_cfg > 0:
+    flow_pred_std = flow_pred.std()
+    cfg_std = flow_pred_cfg.std()
+    if cfg_std > 1e-6:
+        rescale_flow_pred = flow_pred_cfg * (flow_pred_std / cfg_std)
+        flow_pred = rescale_cfg * rescale_flow_pred + (1 - rescale_cfg) * flow_pred_cfg
+```
+
+#### Flow Matching拡散プロセス
+
+**順方向拡散** (`modeling_tadicodec.py:277-280`):
+```python
+# Flow matching公式: xt = (1 - (1 - σ) * t) * z + t * x
+# z ~ N(0, 1) はノイズ、x は元のメルスペクトログラム
+# σ = 1e-5 は数値安定性のための小さな定数
+xt = ((1 - (1 - self.sigma) * t) * z + t * x) * mask + x * (1 - mask)
+```
+
+**逆方向拡散** (`modeling_tadicodec.py:541-597`):
+```python
+# Euler法による反復ノイズ除去
+h = 1.0 / n_timesteps  # ステップサイズ
+for i in range(n_timesteps):
+    t = (0 + (i + 0.5) * h) * torch.ones(z.shape[0])
+    flow_pred = self.decoder(...)  # フロー予測
+    dxt = flow_pred * h
+    xt = xt + dxt  # オイラー法による更新
+```
+
+### 3. ゼロショットTTS の実装
+
+TaDiCodecを使った2種類のTTSアプローチを提供：
+
+#### A. 自己回帰型TTS (AR-TTS)
+
+**実装** (`models/tts/llm_tts/inference_llm_tts.py`):
+
+**処理フロー**:
+```
+1. プロンプト音声をTaDiCodecでエンコード → 音声コード列
+2. LLM（Qwen2.5またはPhi-3）で自己回帰生成
+   - 入力: "Please speak: <テキスト>" + プロンプト音声コード
+   - 出力: ターゲット音声コード列
+3. 生成されたコードをTaDiCodecでデコード → メルスペクトログラム
+4. Vocosで波形に変換
+```
+
+**音声コードの表現** (`inference_llm_tts.py:58-68`):
+```python
+def tensor_to_audio_string(self, tensor):
+    """音声コードを文字列形式に変換
+    例: [123, 456, 789] → "<|start_of_audio|><|audio_123|><|audio_456|><|audio_789|>"
+    """
+    result = "<|start_of_audio|>"
+    for value in values:
+        result += f"<|audio_{value}|>"
+    return result
+```
+
+**LLMによる生成** (`inference_llm_tts.py:211-225`):
+```python
+# プロンプト作成
+prompt = gen_chat_prompt_for_tts(
+    (prompt_text or "") + text,
+    "phi-3" if "Phi" in self.llm_path else "qwen2",
+) + self.tensor_to_audio_string(prompt_speech_code)
+
+# 自己回帰生成
+generate_ids = self.llm.generate(
+    input_ids=torch.tensor(input_ids).unsqueeze(0).to(self.device),
+    min_new_tokens=12,
+    max_new_tokens=400,
+    do_sample=True,
+    top_k=top_k,        # デフォルト: 50
+    top_p=top_p,        # デフォルト: 0.98
+    temperature=temperature,  # デフォルト: 1.0
+)
+```
+
+**デコード** (`inference_llm_tts.py:236-244`):
+```python
+# 生成されたコードを抽出
+combine_speech_code = self.extract_audio_ids(output)
+indices = torch.tensor(combine_speech_code).unsqueeze(0).long()
+
+# TaDiCodecでデコード
+text_token_ids = self.tadicodec.tokenize_text(text, prompt_text)
+rec_mel = self.tadicodec.decode(
+    indices=indices,
+    text_token_ids=text_token_ids,  # テキスト条件
+    prompt_mel=prompt_mel,           # プロンプトメル
+    n_timesteps=n_timesteps,         # 拡散ステップ数（デフォルト25）
+)
+```
+
+#### B. MGM型TTS (Masked Generative Model)
+
+**実装** (`models/tts/llm_tts/inference_mgm_tts.py`):
+
+MGMはマスク拡散により並列生成を実現（自己回帰より高速）：
+
+**処理フロー**:
+```
+1. プロンプト音声をTaDiCodecでエンコード
+2. テキストをトークナイズ
+3. ターゲット長を推定（プロンプトとテキストの比率から）
+4. MGMマスク拡散で並列生成
+5. TaDiCodecでデコード
+```
+
+**ターゲット長の推定** (`inference_mgm_tts.py:248-259`):
+```python
+if target_len is None:
+    # テキストの長さ比からターゲット音声長を推定
+    prompt_text_len = len(prompt_text.encode("utf-8"))
+    target_text_len = len(text.encode("utf-8"))
+    prompt_speech_len = librosa.get_duration(filename=prompt_speech_path)
+    target_speech_len = prompt_speech_len * target_text_len / prompt_text_len
+    target_len = int(target_speech_len * frame_rate)  # frame_rate = 6.25 Hz
+```
+
+**MGM逆拡散** (`inference_mgm_tts.py:268-275`):
+```python
+generated_codes = self.mgm.reverse_diffusion(
+    prompt=prompt_codes,           # プロンプトコード
+    target_len=target_len,         # ターゲット長
+    phone_id=text_token_ids,       # テキストトークン
+    n_timesteps=n_timesteps_mgm,   # MGM拡散ステップ（デフォルト25）
+    cfg=1.5,                       # CFG強度
+    rescale_cfg=0.75,              # CFG再スケーリング
+)
+```
+
+#### コードスイッチング対応
+
+**例** (`use_examples/test_mgm_tts.py:23`):
+```python
+text = "但是 to those who 知道 her well, it was a 标志 of her unwavering 决心 and spirit."
+# 中国語と英語が自然に混在
+```
+
+両方のTTSモデルは多言語トークナイザーを使用し、言語を切り替えながらの音声合成が可能です。
+
+## 環境構築（Windows）
+
+このPCにはUVがインストール済みです。以下の手順で環境を構築できます：
+
+### ステップ1: Python環境のセットアップ
+
+```bash
+# Python 3.10のインストール
+uv python install 3.10
+
+# 仮想環境の作成
+uv venv --python 3.10
+
+# 仮想環境の有効化（PowerShell）
+.\.venv\Scripts\activate.ps1
+# または（bash/Git Bash）
+# source .venv/Scripts/activate
+```
+
+### ステップ2: 基本パッケージのインストール
+
+```bash
+# ビルドツールと基本パッケージ
+uv pip install setuptools wheel psutil packaging ninja numpy hf_xet
+```
+
+### ステップ3: PyTorch（CUDA版）のインストール
+
+```bash
+# CUDA 12.8対応のPyTorch 2.8.0をインストール
+uv pip install torch==2.8.0 torchaudio --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128
+
+# CPUのみの場合（GPUなし）:
+# uv pip install torch==2.8.0 torchaudio
+```
+
+### ステップ4: コアパッケージのインストール
+
+```bash
+# TaDiCodecの主要な依存関係
+uv pip install transformers==4.42.4 librosa huggingface_hub accelerate scipy json5 resampy tqdm tensorboard einops safetensors omegaconf
+
+# 追加の必須パッケージ
+uv pip install pyopenjtalk-plus  # 日本語対応（Windows用）
+uv pip install pyworld ruamel.yaml six tensorboardX
+```
+
+### ステップ5: Flash Attentionのインストール（推奨）
+
+Flash Attentionは推論速度を大幅に向上させます（2-3倍高速化）。
+
+**方法1: ビルド済みホイールを使用（推奨）**
+
+```bash
+# wheelをダウンロード
+curl -L -o flash_attn-2.7.4.post1-cu128-torch2.8.0-cp310-cp310-win_amd64.whl "https://huggingface.co/kim512/flash_attn-2.7.4.post1/resolve/main/flash_attn-2.7.4.post1-cu128-torch2.8.0-cp310-cp310-win_amd64.whl"
+
+# wheelファイル名を標準形式にリネーム（uvの制約のため）
+cp flash_attn-2.7.4.post1-cu128-torch2.8.0-cp310-cp310-win_amd64.whl flash_attn-2.7.4.post1-cp310-cp310-win_amd64.whl
+
+# インストール（UV_SKIP_WHEEL_FILENAME_CHECKを設定）
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install flash_attn-2.7.4.post1-cp310-cp310-win_amd64.whl
+
+# wheelファイルをクリーンアップ
+rm flash_attn*.whl
+```
+
+**方法2: Flash Attentionなしでも動作**
+
+Flash Attentionのインストールに失敗しても、TaDiCodecは自動的に標準Attentionにフォールバックします。品質は同じですが、速度が遅くなります（2-3倍）。
+
+### ステップ6: 環境のテスト
+
+```bash
+# GPU環境のテスト
+.venv/Scripts/python.exe test_gpu_setup.py
+
+# 期待される出力:
+# GPU name: NVIDIA GeForce RTX 4070 Ti SUPER (または他のGPU)
+# CUDA available: True
+# CUDA version: 12.8
+# Flash Attention version: 2.7.4.post1 (インストールした場合)
+```
+
+### トラブルシューティング
+
+**問題1: `pyopenjtalk`のビルドエラー**
+- 解決策: `pyopenjtalk-plus`を使用（上記手順に含まれています）
+
+**問題2: Flash Attentionのインストール失敗**
+- wheelファイル名を標準形式にリネームしたか確認
+- `UV_SKIP_WHEEL_FILENAME_CHECK=1`を設定したか確認
+- 失敗してもTaDiCodecは動作します（速度が遅くなるだけ）
+
+**問題3: CUDA/GPU認識されない**
+- NVIDIAドライバーが最新か確認
+- CUDA 12.8対応のドライバー（バージョン525以上）が必要
+
+### インストール完了後の確認
+
+```bash
+# パッケージのインポートテスト
+.venv/Scripts/python.exe -c "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())"
+
+# TaDiCodecモジュールのインポートテスト
+.venv/Scripts/python.exe -c "from models.tts.tadicodec.inference_tadicodec import TaDiCodecPipline; print('TaDiCodec import successful!')"
+
+# Flash Attentionのテスト（インストールした場合）
+.venv/Scripts/python.exe -c "import flash_attn; print('Flash Attention:', flash_attn.__version__)"
+```
+
+## よく使うコマンド
+
+### モデルのダウンロードとテスト
+
+```bash
+# すべてのモデルをHugging Faceからダウンロード
+python test_auto_download.py
+
+# サンプルテスト（use_examples/から実行）
+cd use_examples
+python test_auto_download.py     # モデルダウンロード
+python test_llm_tts.py           # 自己回帰型TTSのテスト
+python test_mgm_tts.py           # MGM型TTSのテスト
+python test_rec.py               # トークン化と再構成のテスト
+```
+
+### トレーニング（開発中）
+
+```bash
+# TaDiCodecモデルの学習
+python bins/tts/train.py --config <config_path> --exp_name <experiment_name>
+
+# 例:
+python bins/tts/train.py --config egs/tts/TaDiCodec/tadicodec_6_25hz_16384_bsq.json --exp_name my_tadicodec
+
+# 学習の再開
+python bins/tts/train.py --config <config_path> --exp_name <experiment_name> --resume --checkpoint_path <checkpoint_path>
+```
+
+## アーキテクチャ詳細
+
+### コアコンポーネント
+
+#### 1. TaDiCodecモデル (`models/tts/tadicodec/modeling_tadicodec.py`)
+
+**エンコーダー**:
+- Llama型の非自己回帰transformerアーキテクチャ
+- メルスペクトログラムを潜在表現に変換
+- レイヤー数: 8、隠れ層次元: 1024、ヘッド数: 16
+- テキストや拡散ステップの条件付けなし
+
+**ベクトル量子化（VQ）**:
+- Binary Spherical Quantization (BSQ)
+- 14次元の2値ベクトル（2^14 = 16384コードブック）
+- L2正規化により超球面上で量子化
+- エントロピー損失により均等な符号利用
+
+**デコーダー**:
+- Llama型の非自己回帰transformerアーキテクチャ
+- Flow matchingベースの拡散プロセス
+- レイヤー数: 16、隠れ層次元: 1024、ヘッド数: 16
+- テキスト埋め込み、VQコード、拡散ステップで条件付け
+- Classifier-Free Guidanceによる品質向上
+
+#### 2. TTSモデル
+
+**自己回帰型TTS** (`models/tts/llm_tts/`):
+- バックボーン: Qwen2.5（0.5B / 3B）またはPhi-3.5（4B）
+- 音声コードを特殊トークンとして扱う
+- 自己回帰的にコード列を生成
+- コードスイッチング対応
+
+**MGM TTS** (`models/tts/llm_tts/mgm.py`):
+- Masked Generative Model（MaskGCTベース）
+- マスク拡散による並列トークン生成
+- 自己回帰より高速
+- テキストで条件付け
+
+#### 3. Vocoder
+
+**Vocos** (`models/codec/amphion_codec/vocos.py`):
+- メルスペクトログラムから波形への変換
+- Transformerベースのアーキテクチャ
+- レイヤー数: 30、次元: 1024
+
+### データフロー
+
+```
+[入力音声] → メル抽出 → エンコーダー → ダウンサンプル(÷8) → VQ (BSQ) → コード
+                                                                        ↓
+[再構成音声] ← Vocoder ← デコーダー ← アップサンプル(×8) ← コード埋め込み
+                           ↑
+                     [テキスト埋め込み]
+                     [プロンプトメル]
+```
+
+### 主要設計パターン
+
+- **自動ダウンロードシステム**: `_resolve_model_path()`でHugging Faceから自動取得
+- **パイプラインパターン**: `TaDiCodecPipline`、`TTSInferencePipeline`、`MGMInferencePipeline`でモデル読み込みと推論をカプセル化
+- **Accelerateベースの学習**: Hugging Face Accelerateによる分散学習
+- **設定駆動アーキテクチャ**: `config/`と`egs/`のJSON設定でハイパーパラメータを定義
+
+### 重要ファイルの場所
+
+- **推論パイプライン**:
+  - `models/tts/tadicodec/inference_tadicodec.py`
+  - `models/tts/llm_tts/inference_llm_tts.py`
+  - `models/tts/llm_tts/inference_mgm_tts.py`
+- **モデルアーキテクチャ**:
+  - `models/tts/tadicodec/modeling_tadicodec.py`
+  - `models/tts/tadicodec/llama_nar_prefix.py`
+- **学習**:
+  - `models/base/tts_trainer.py`
+  - `models/tts/tadicodec/tadicodec_trainer.py`
+- **量子化**:
+  - `models/codec/amphion_codec/quantize/bsq.py`
+- **設定ファイル**:
+  - `config/base.json`
+  - `config/tts.json`
+  - `egs/tts/TaDiCodec/tadicodec_6_25hz_16384_bsq.json`
+
+## モデル読み込み
+
+すべてのモデルはローカルパスとHugging Faceモデル IDの両方に対応：
+
+```python
+from models.tts.tadicodec.inference_tadicodec import TaDiCodecPipline
+from models.tts.llm_tts.inference_llm_tts import TTSInferencePipeline
+
+# Hugging Faceから（自動ダウンロード）
+pipe = TaDiCodecPipline.from_pretrained("amphion/TaDiCodec")
+tts = TTSInferencePipeline.from_pretrained(
+    tadicodec_path="amphion/TaDiCodec",
+    llm_path="amphion/TaDiCodec-TTS-AR-Qwen2.5-0.5B"
+)
+
+# ローカルパスから
+pipe = TaDiCodecPipline.from_pretrained("./ckpt/TaDiCodec")
+```
+
+## 事前学習済みモデル
+
+### TaDiCodecトークナイザー
+- `amphion/TaDiCodec`（推奨）
+- `amphion/TaDiCodec-old`（レガシー、AR-Phi-3.5-4Bで使用）
+
+### TTSモデル
+- **自己回帰型**:
+  - `amphion/TaDiCodec-TTS-AR-Qwen2.5-0.5B`
+  - `amphion/TaDiCodec-TTS-AR-Qwen2.5-3B`
+  - `amphion/TaDiCodec-TTS-AR-Phi-3.5-4B`（TaDiCodec-oldを使用）
+- **MGMモデル**:
+  - `amphion/TaDiCodec-TTS-MGM`
+
+## 重要な注意事項
+
+- **Pythonバージョン**: Python 3.10が必須
+- **PyTorchバージョン**: torch==2.8.0（CUDA 12.8対応）
+- **Flash Attention**: パフォーマンスに重要。Windowsではビルド済みホイール推奨
+- **Transformersバージョン**: 互換性のため4.42.4に固定
+- **音声フォーマット**: すべてのモデルは24kHz音声を想定
+- **テキスト認識**: デコーダーはテキスト条件付けで再構成品質を向上
+- **コードスイッチング**: TTSモデルは多言語コードスイッチングに対応（例: 英語と中国語の混在）
+
+## 開発ステータス
+
+### ✅ 完成
+- TaDiCodec推論パイプライン
+- 自己回帰型・MGM型TTS推論
+- Hugging Faceからの自動ダウンロード
+- 再構成パイプライン
+
+### 🚧 開発中
+- TaDiCodec学習スクリプト
+- TTSモデル学習スクリプト
+- 評価スクリプト
+- テキスト入力用の自動ASR
+
+## 参考文献
+
+論文: "TaDiCodec: Text-aware Diffusion Speech Tokenizer for Speech Language Modeling" (NeurIPS 2025)
+
+以下のプロジェクトをベースに構築:
+- MaskGCT
+- Vocos
+- Hugging Face Transformers
+- vector-quantize-pytorch
+- bsq-vit
+- Amphion
+- Accelerate
