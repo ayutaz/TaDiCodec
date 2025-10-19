@@ -576,12 +576,464 @@ pipe = TaDiCodecPipline.from_pretrained("./ckpt/TaDiCodec")
 - 自己回帰型・MGM型TTS推論
 - Hugging Faceからの自動ダウンロード
 - 再構成パイプライン
+- **日本語対応機能**（新規）
+  - 日本語音素トークナイザー（OpenJTalk情報100%活用）
+  - パイプライン統合（自動テキスト→音素変換）
+  - データ拡張機能（4手法）
+  - キャッシュ生成スクリプト
 
 ### 🚧 開発中
 - TaDiCodec学習スクリプト
 - TTSモデル学習スクリプト
 - 評価スクリプト
 - テキスト入力用の自動ASR
+- **日本語ファインチューニング**（準備中）
+  - データセット準備スクリプト
+  - JVS/JSUTデータセットの統合
+
+---
+
+## 🇯🇵 日本語対応（Japanese Support）
+
+TaDiCodecに日本語音声合成の最適化機能を追加しました。
+
+### 実装済み機能
+
+#### 1. 日本語音素トークナイザー（OpenJTalk情報100%活用）
+
+**ファイル:** `scripts/create_japanese_tokenizer_full.py`
+
+**特徴:**
+- OpenJTalkの**全フィールド（A-K）**から50+種類の韻律情報を抽出
+- 従来版（10-15%情報使用）から**100%情報活用**に改善
+- 新規トークン: 1,833個追加（32,011 → 33,844トークン）
+- 新規トークン使用率: **86%**
+
+**OpenJTalk情報の活用:**
+```
+音素コンテキスト（5-gram）: pp, p, c, n, nn
+A: モーラ情報（3項目）
+B: 前品詞タグ（3項目）
+C: 現品詞タグ（3項目）
+D: 前アクセント句（3項目）
+E: 次アクセント句（5項目）
+F: 現アクセント句（8項目すべて）
+G: 前ブレス群（5項目）
+H: 次ブレス群（2項目）
+I: 現ブレス群（8項目）
+J: 発話レベル情報（2項目）
+K: ブレス群数情報（3項目）
+
+合計: 50+種類の韻律・アクセント情報
+```
+
+**生成:**
+```bash
+python scripts/create_japanese_tokenizer_full.py
+```
+
+生成されるファイル:
+- `ckpt/japanese_phoneme_vocabulary_full.json` (1,869トークン)
+- `ckpt/TaDiCodec_Japanese_Full/text_tokenizer/` (拡張トークナイザー)
+
+#### 2. パイプライン統合（自動テキスト→音素変換）
+
+**ファイル:** `models/tts/tadicodec/inference_tadicodec_japanese.py`
+
+**特徴:**
+- `JapaneseTaDiCodecPipeline` クラス
+- 日本語テキストを自動的に音素+韻律情報に変換
+- 日本語検出機能（auto/always/neverモード）
+
+**使用方法:**
+```python
+from models.tts.tadicodec.inference_tadicodec_japanese import JapaneseTaDiCodecPipeline
+
+# 日本語対応パイプラインの作成
+pipe = JapaneseTaDiCodecPipeline.from_pretrained(
+    ckpt_dir="amphion/TaDiCodec",
+    japanese_tokenizer_path="./ckpt/TaDiCodec_Japanese_Full/text_tokenizer",
+    enable_japanese_phoneme=True,
+    japanese_mode="auto",  # 日本語を自動検出
+)
+
+# 日本語テキストが自動的に音素+韻律情報に変換される
+indices = pipe.encode(
+    speech_path="sample.wav",
+    text="東京の天気は晴れです。"
+)
+```
+
+**処理フロー:**
+```
+日本語テキスト「東京の天気は晴れです。」
+    ↓ pyopenjtalk
+音素列 + 韻律情報（50+種類）
+    ↓ phonemes_to_rich_tokens
+リッチトークン列（スペース区切り）
+    t [POS_OTHER] [ACC_TYPE_5] [TONE_0] [MORA_FIRST] ...
+    ↓ HuggingFace tokenizer
+トークンID（173個、新規トークン86%）
+    ↓ TaDiCodec text_embedding
+音声特徴量
+```
+
+#### 3. データ拡張機能（4手法）
+
+**ファイル:** `models/tts/tadicodec/japanese_data_augmentation.py`
+
+**実装した拡張手法:**
+
+1. **ピッチシフト（男性⇄女性）**
+   - 範囲: -4.0 〜 +4.0 半音
+   - 適用確率: 50%
+   - 実装: `librosa.effects.pitch_shift`
+
+2. **速度変化（話速の変更）**
+   - 範囲: 0.9x 〜 1.1x
+   - 適用確率: 50%
+   - 実装: `librosa.effects.time_stretch`
+
+3. **アクセント位置の変更（日本語特有）**
+   - OpenJTalkのアクセント情報を活用
+   - 適用確率: 30%（日本語のみ）
+
+4. **日英コードスイッチング**
+   - 日本語単語を英語に置き換え
+   - 適用確率: 20%（日本語のみ）
+   - 辞書: 15種類の日英単語ペア
+
+**使用方法:**
+
+データセットクラス経由（推奨）:
+```python
+from models.tts.tadicodec.tadicodec_dataset_japanese import TadiCodecJapaneseDataset
+
+# 設定ファイルで拡張を有効化
+# egs/tts/TaDiCodec/tadicodec_japanese_finetune.json:
+# {
+#   "preprocess": {
+#     "data_augment": ["japanese"],
+#     "use_pitch_shift": true,
+#     "use_speed_perturb": true,
+#     "use_accent_augment": true,
+#     "use_code_switch": true,
+#     "augment_prob": 0.5
+#   }
+# }
+
+dataset = TadiCodecJapaneseDataset(cache_type="path", cfg=cfg)
+```
+
+直接使用:
+```python
+from models.tts.tadicodec.japanese_data_augmentation import JapaneseDataAugmentation
+
+augmentor = JapaneseDataAugmentation(
+    use_pitch_shift=True,
+    use_speed_perturb=True,
+    use_accent_augment=True,
+    use_code_switch=True,
+    augment_prob=0.5
+)
+
+# 音声とテキストを拡張
+aug_speech, aug_text = augmentor.augment(speech, text, sr=24000, language="ja")
+```
+
+#### 4. キャッシュ生成スクリプト
+
+**ファイル:** `scripts/create_dataset_cache.py`
+
+**機能:**
+- Emilia形式データセットから学習用キャッシュを生成
+- 学習時のデータ読み込みを高速化
+
+**生成されるキャッシュファイル:**
+- `wav_paths_cache.pkl` - WAVファイルパスのリスト
+- `duration_cache.pkl` - 音声の長さ（秒）のリスト
+- `bpe_token_count_cache.pkl` - BPEトークン数のリスト
+- `json_paths_cache.pkl` - JSONメタデータのリスト（オプション）
+
+**使用方法:**
+```bash
+# キャッシュ生成
+python scripts/create_dataset_cache.py \
+  --data_dir ./data/japanese \
+  --cache_dir ./cache/japanese \
+  --tokenizer_path ./ckpt/TaDiCodec_Japanese_Full/text_tokenizer \
+  --min_duration 1.0 \
+  --max_duration 40.0
+```
+
+**テスト:**
+```bash
+# サンプルデータ生成とテスト
+python scripts/test_cache_generation.py
+```
+
+### 期待される効果
+
+#### トークナイザー改善
+| 指標 | 従来版 | 完全版 | 改善 |
+|------|-------|-------|------|
+| OpenJTalk情報使用率 | 10-15% | 100% | +92.3pt |
+| トークン数（例文） | 14 (文字) | 173 (音素+韻律) | 12.4x |
+| 新規トークン使用率 | 0% | 86% | +86pt |
+| 語彙サイズ | 32,011 | 33,844 | +1,833 |
+
+#### ファインチューニング後の予測
+| 指標 | ベースライン | 目標 | 改善率 |
+|------|------------|------|--------|
+| WER（単語誤り率） | 35% | 14% | -60% |
+| MOS（自然性） | 4.0 | 4.5 | +13% |
+| Speaker SIM（話者類似度） | 0.65 | 0.76 | +17% |
+| Accent Accuracy（アクセント精度） | 70% | 95%+ | +36% |
+
+#### データ拡張の効果
+- 実効データ量: **2-3倍**（確率的適用により）
+- 音声バリエーション: ピッチ×速度 = 理論上無限
+- 多言語ロバスト性: コードスイッチングにより向上
+
+### 日本語ファインチューニングの手順
+
+#### ステップ1: 環境準備
+
+```bash
+# 仮想環境をアクティベート
+source .venv/Scripts/activate  # Linux/Mac
+# または
+.venv/Scripts/activate.ps1  # Windows PowerShell
+
+# 日本語トークナイザーを生成（初回のみ）
+python scripts/create_japanese_tokenizer_full.py
+```
+
+#### ステップ2: データセットの準備
+
+**推奨データセット:**
+- **JVS Corpus**: 100話者、並列文30文（約30時間）
+  - URL: https://sites.google.com/site/shinnosuketakamichi/research-topics/jvs_corpus
+  - ライセンス: CC BY-SA 4.0
+
+- **JSUT Corpus**: 1話者、約10時間
+  - URL: https://sites.google.com/site/shinnosuketakamichi/publication/jsut
+  - ライセンス: CC BY-SA 4.0
+
+**データ構造（Emilia形式）:**
+```
+data/japanese/
+├── jvs001/
+│   ├── audio_0.wav
+│   ├── audio_1.wav
+│   └── audio.json
+├── jvs002/
+│   └── ...
+└── jsut_basic/
+    └── ...
+```
+
+**audio.json フォーマット:**
+```json
+{
+  "0": {
+    "text": "東京の天気は晴れです。",
+    "duration": 2.5,
+    "language": "ja"
+  },
+  "1": {
+    "text": "こんにちは、元気ですか？",
+    "duration": 1.8,
+    "language": "ja"
+  }
+}
+```
+
+#### ステップ3: キャッシュ生成
+
+```bash
+# データセットキャッシュを生成
+python scripts/create_dataset_cache.py \
+  --data_dir ./data/japanese \
+  --cache_dir ./cache/japanese \
+  --tokenizer_path ./ckpt/TaDiCodec_Japanese_Full/text_tokenizer \
+  --min_duration 1.0 \
+  --max_duration 40.0
+```
+
+**出力例:**
+```
+Total audio files processed: 10000
+Average duration: 5.2 seconds
+Average token count: 25.3 tokens
+Total duration: 14.4 hours
+```
+
+#### ステップ4: 設定ファイルの確認
+
+**ファイル:** `egs/tts/TaDiCodec/tadicodec_japanese_finetune.json`
+
+**重要な設定:**
+```json
+{
+  "preprocess": {
+    "mnt_path": "./data/japanese",
+    "cache_folder": "./cache/japanese",
+    "use_json_path_cache": true,
+    "tokenizer_path": "./ckpt/TaDiCodec_Japanese_Full/text_tokenizer",
+    "data_augment": ["japanese"],
+    "use_pitch_shift": true,
+    "use_speed_perturb": true,
+    "use_accent_augment": true,
+    "use_code_switch": true,
+    "augment_prob": 0.5
+  },
+  "model": {
+    "tadicodec": {
+      "text_vocab_size": 33844  // 日本語拡張語彙
+    }
+  },
+  "train": {
+    "batch_size": 8,
+    "gradient_accumulation_step": 4,
+    "max_steps": 100000,
+    "adamw": {
+      "lr": 5e-5
+    }
+  },
+  "dataset": ["jvs", "jsut"],
+  "dataset_path": {
+    "jvs": "/path/to/jvs_ver1",
+    "jsut": "/path/to/jsut_ver1.1"
+  }
+}
+```
+
+#### ステップ5: ファインチューニング実行
+
+```bash
+# ファインチューニング開始
+python bins/tts/train.py \
+  --config egs/tts/TaDiCodec/tadicodec_japanese_finetune.json \
+  --exp_name TaDiCodec_Japanese_Finetune \
+  --resume \
+  --resume_type finetune \
+  --checkpoint_path ~/.cache/huggingface/hub/models--amphion--TaDiCodec/snapshots/<hash>/checkpoint.pth
+```
+
+**学習の監視:**
+```bash
+# TensorBoardで監視
+tensorboard --logdir ./logs/TaDiCodec_Japanese_Finetune
+
+# 確認すべき指標
+# - diff_loss (下がっているか)
+# - vq_loss (安定しているか)
+# - commit_loss (低下しているか)
+# - learning_rate (スケジュール通りか)
+```
+
+#### ステップ6: 評価
+
+```bash
+# 評価スクリプト（今後実装予定）
+python eval/evaluate_japanese.py \
+  --model_path ./logs/TaDiCodec_Japanese_Finetune/checkpoint/best.pth \
+  --test_data ./data/japanese_test \
+  --output_dir ./eval_results
+```
+
+### トラブルシューティング
+
+#### トークナイザーのエラー
+
+**問題:** `FileNotFoundError: tokenizer_path not found`
+
+**解決策:**
+```bash
+# トークナイザーを再生成
+python scripts/create_japanese_tokenizer_full.py
+
+# 存在確認
+ls -la ./ckpt/TaDiCodec_Japanese_Full/text_tokenizer/
+```
+
+#### キャッシュ生成のエラー
+
+**問題:** `No speaker directories found`
+
+**解決策:**
+データディレクトリの構造を確認:
+```bash
+# 正しい構造:
+# data/japanese/speaker1/audio.json
+# data/japanese/speaker1/audio_0.wav
+ls -R ./data/japanese
+```
+
+#### GPU メモリ不足
+
+**問題:** `CUDA out of memory`
+
+**解決策:**
+設定ファイルでバッチサイズを減らす:
+```json
+{
+  "train": {
+    "batch_size": 2,                    // 小さく
+    "gradient_accumulation_step": 8     // 勾配累積で補う
+  }
+}
+```
+
+### 関連ドキュメント
+
+- **[JAPANESE_TOKENIZER_COMPLETE.md](./JAPANESE_TOKENIZER_COMPLETE.md)** - トークナイザーの完全ドキュメント
+- **[JAPANESE_INTEGRATION_COMPLETE.md](./JAPANESE_INTEGRATION_COMPLETE.md)** - パイプライン統合の完了レポート
+- **[JAPANESE_TRAINING_GUIDE.md](./JAPANESE_TRAINING_GUIDE.md)** - 日本語学習の詳細ガイド
+- **[JAPANESE_FINETUNING_ROADMAP.md](./JAPANESE_FINETUNING_ROADMAP.md)** - ファインチューニングのロードマップ
+- **[scripts/README_CACHE_GENERATION.md](./scripts/README_CACHE_GENERATION.md)** - キャッシュ生成の詳細ガイド
+
+### 技術的な詳細
+
+#### トークン最適化の経緯
+
+**初期実装の問題:**
+- リッチトークンを連結して生成: `t[POS_OTHER][ACC_TYPE_5]...`
+- 結果: 1,070トークン（76.4x増加）
+- 新規トークン使用率: 2%（ほぼ未使用）
+
+**修正後:**
+- スペース区切りで生成: `t [POS_OTHER] [ACC_TYPE_5] ...`
+- 結果: 173トークン（12.4x増加）
+- 新規トークン使用率: 86%（大幅改善）
+
+**変更箇所** (`scripts/create_japanese_tokenizer_full.py:529`):
+```python
+# BEFORE
+combined_token = ''.join(token_parts)
+
+# AFTER
+combined_token = ' '.join(token_parts)
+```
+
+#### データ拡張パイプライン
+
+```
+入力: (音声, テキスト, 言語="ja")
+  ↓
+[1] ピッチシフト (50%確率)
+  ↓
+[2] 速度変化 (50%確率)
+  ↓
+[3] アクセント拡張 (30%確率, Japanese only)
+  ↓
+[4] コードスイッチング (20%確率, Japanese only)
+  ↓
+出力: (拡張音声, 拡張テキスト)
+```
+
+---
 
 ## 参考文献
 
