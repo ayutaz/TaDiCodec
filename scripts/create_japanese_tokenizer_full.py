@@ -525,8 +525,8 @@ class CompleteJapanesePhonemeTokenizer:
                     elif utt_pc > 2:
                         token_parts.append('[UTT_POS_MID]')
 
-            # トークンの結合
-            combined_token = ''.join(token_parts)
+            # トークンの結合（スペース区切りで各マーカーを独立させる）
+            combined_token = ' '.join(token_parts)
             tokens.append(combined_token)
 
         return tokens
