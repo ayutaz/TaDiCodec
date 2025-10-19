@@ -1,0 +1,103 @@
+{
+  "base_config": "egs/tts/TaDiCodec/tadicodec_6_25hz_16384_bsq.json",
+  "exp_name": "TaDiCodec_Japanese_Finetune",
+  "preprocess": {
+    "sample_rate": 24000,
+    "hop_size": 480,
+    "n_fft": 1920,
+    "win_size": 1920,
+    "num_mels": 128,
+    "fmin": 0,
+    "fmax": 12000,
+    "frame_rate": 50,
+    "mel_mean": 0.0,
+    "mel_var": 1.0,
+    "min_dur": 1,
+    "max_dur": 40,
+    "tokenizer_path": "./ckpt/TaDiCodec_Japanese_Full/text_tokenizer",
+    "mnt_path": "./",
+    "cache_folder": "./cache/japanese",
+    "use_json_path_cache": true,
+    "use_lang_offset": false,
+    "data_augment": ["japanese"],
+    "use_pitch_shift": true,
+    "use_speed_perturb": true,
+    "use_accent_augment": true,
+    "use_code_switch": true,
+    "pitch_shift_range": [-4.0, 4.0],
+    "speed_perturb_range": [0.9, 1.1],
+    "augment_prob": 0.5
+  },
+  "model": {
+    "tadicodec": {
+      "hidden_size": 1024,
+      "vq_emb_dim": 14,
+      "down_sample_factor": 8,
+      "n_codes": 16384,
+      "n_heads": 16,
+      "head_dim": 64,
+      "num_encoder_layers": 8,
+      "num_decoder_layers": 16,
+      "use_text_cond": true,
+      "text_vocab_size": 33844,
+      "cond_drop_p": 0.2,
+      "sigma": 1e-5,
+      "bsq_quantizer": {
+        "dim": 14,
+        "num_heads": 1,
+        "codebook_size": 16384,
+        "proj_factor": 1,
+        "commitment_loss_weight": 1.0,
+        "entropy_loss_weight": 0.1,
+        "entropy_loss_weight_gamma": 0.05
+      }
+    }
+  },
+  "train": {
+    "batch_size": 8,
+    "gradient_accumulation_step": 4,
+    "max_steps": 100000,
+    "save_checkpoint_stride": 5000,
+    "checkpoints_path": "./ckpt",
+    "keep_last": 5,
+    "run_eval": true,
+    "adamw": {
+      "lr": 5e-5,
+      "adam_b1": 0.9,
+      "adam_b2": 0.999,
+      "adam_eps": 1e-8,
+      "weight_decay": 0.0
+    },
+    "lr_scheduler": {
+      "warmup_steps": 5000,
+      "min_lr": 1e-6
+    },
+    "tracker": [
+      "tensorboard",
+      "wandb"
+    ],
+    "max_grad_norm": 1.0,
+    "mixed_precision": "fp16",
+    "seed": 42
+  },
+  "dataset": [
+    "jvs",
+    "jsut"
+  ],
+  "dataset_path": {
+    "jvs": "/path/to/jvs_ver1",
+    "jsut": "/path/to/jsut_ver1.1"
+  },
+  "dataset_config": {
+    "jvs": {
+      "split_ratio": [0.98, 0.01, 0.01],
+      "languages": ["ja"],
+      "use_speaker_id": true
+    },
+    "jsut": {
+      "split_ratio": [0.98, 0.01, 0.01],
+      "languages": ["ja"],
+      "use_speaker_id": false
+    }
+  }
+}
