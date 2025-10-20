@@ -840,10 +840,21 @@ python scripts/precompute_text_tokens.py `
 # PowerShellで実行（仮想環境アクティブ時）
 python bins/tts/train.py `
   --config egs/tts/TaDiCodec/tadicodec_japanese_finetune.json `
-  --exp_name TaDiCodec_Japanese_Final2 `
+  --exp_name TaDiCodec_Japanese_JVS_Optimized `
   --resume_type finetune `
   --checkpoint_path ./ckpt/TaDiCodec
 ```
+
+```cmd
+REM または仮想環境を明示的に指定
+.venv\Scripts\python.exe bins\tts\train.py --config egs\tts\TaDiCodec\tadicodec_japanese_finetune.json --exp_name TaDiCodec_Japanese_JVS_Optimized --resume_type finetune --checkpoint_path .\ckpt\TaDiCodec
+```
+
+**最適化された設定（tadicodec_japanese_finetune.json）:**
+- 学習率: `1e-5`（安定性向上、振動抑制）
+- ウォームアップ: `1,000` steps（高速収束）
+- ログ保存頻度: `100` steps（リアルタイム監視）
+- 混合精度: `bf16`（RTX 30/40シリーズ最適化）
 
 **期待される初期化ログ:**
 ```
