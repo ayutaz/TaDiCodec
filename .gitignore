@@ -9,5 +9,14 @@ ckpt
 # Generated audio files
 *.wav
 
+# Cache files (preprocessed mel spectrograms, dataset cache)
+cache/
+
+# Training logs and checkpoints
+logs/
+
+# Dataset files
+data/
+
 # Claude Code configuration
 .claude/

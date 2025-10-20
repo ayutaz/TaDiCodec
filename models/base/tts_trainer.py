@@ -396,10 +396,55 @@ class TTSTrainer(BaseTrainer):
 
         elif resume_type == "finetune":
             # Load only the model weights
-            accelerate.load_checkpoint_and_dispatch(
-                self.accelerator.unwrap_model(self.model),
-                os.path.join(checkpoint_path, "pytorch_model.bin"),
-            )
+            # Try to load from safetensors first (faster), then fall back to pytorch_model.bin
+            safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
+            pytorch_model_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+
+            # Get target device from model
+            model = self.accelerator.unwrap_model(self.model)
+            target_device = next(model.parameters()).device
+            self.logger.info(f"Target device for checkpoint loading: {target_device}")
+
+            if os.path.exists(safetensors_path):
+                # Use safetensors (faster loading) - load directly to GPU
+                from safetensors.torch import load_file
+                self.logger.info(f"Loading model weights from {safetensors_path} directly to {target_device}...")
+                state_dict = load_file(safetensors_path, device=str(target_device))
+                self.logger.info(f"Loaded checkpoint to {target_device}")
+            elif os.path.exists(pytorch_model_path):
+                # Fall back to pytorch_model.bin - load directly to target device
+                self.logger.info(f"Loading model weights from {pytorch_model_path} to {target_device}...")
+                state_dict = torch.load(pytorch_model_path, map_location=target_device)
+                self.logger.info(f"Loaded checkpoint to {target_device}")
+            else:
+                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+
+            # Filter out mismatched keys (e.g., text_emb.weight when vocab size changed)
+            model_state_dict = model.state_dict()
+            filtered_state_dict = {}
+            mismatched_keys = []
+
+            for key, value in state_dict.items():
+                if key in model_state_dict:
+                    if value.shape == model_state_dict[key].shape:
+                        filtered_state_dict[key] = value
+                    else:
+                        mismatched_keys.append(f"{key} (checkpoint: {value.shape}, model: {model_state_dict[key].shape})")
+                        # For text embeddings, we can copy the overlapping part
+                        if "text_emb" in key and value.ndim == 2:
+                            min_vocab = min(value.shape[0], model_state_dict[key].shape[0])
+                            filtered_state_dict[key] = model_state_dict[key].clone()
+                            filtered_state_dict[key][:min_vocab] = value[:min_vocab]
+                            self.logger.info(f"Partially loaded {key}: copied {min_vocab} embeddings")
+
+            if mismatched_keys:
+                self.logger.warning(f"Skipped {len(mismatched_keys)} mismatched keys during finetuning:")
+                for key in mismatched_keys:
+                    self.logger.warning(f"  - {key}")
+
+            self.logger.info("Applying checkpoint weights to model...")
+            model.load_state_dict(filtered_state_dict, strict=False)
+            self.logger.info("Model weights loaded successfully for finetune.")
             self.logger.info("Load model weights for finetune...")
 
         else:
@@ -620,11 +665,13 @@ class TTSTrainer(BaseTrainer):
         r"""Training epoch. Should return average loss of a batch (sample) over
         one epoch. See ``train_loop`` for usage.
         """
+        print(f"[DEBUG _train_epoch] Entered _train_epoch(), epoch={self.epoch}", flush=True)
         if isinstance(self.model, dict):
             for key in self.model.keys():
                 self.model[key].train()
         else:
             self.model.train()
+        print(f"[DEBUG _train_epoch] Model set to train mode", flush=True)
 
         epoch_sum_loss: float = 0.0
         epoch_losses: dict = {}
@@ -669,16 +716,20 @@ class TTSTrainer(BaseTrainer):
         # 跟踪当前处理的batch数
         current_batch = steps_to_skip
 
-        for batch in self.train_dataloader:
+        for batch_idx, batch in enumerate(self.train_dataloader):
+            print(f"[DEBUG _train_epoch] Got batch {batch_idx} from DataLoader", flush=True)
             # Put the data to cuda device
             device = self.accelerator.device
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
+            print(f"[DEBUG _train_epoch] Batch {batch_idx} moved to {device}", flush=True)
 
             # Do training step and BP
             with self.accelerator.accumulate(self.model):
+                print(f"[DEBUG _train_epoch] Calling _train_step() for batch {batch_idx}", flush=True)
                 total_loss, train_losses, training_stats = self._train_step(batch)
+                print(f"[DEBUG _train_epoch] _train_step() completed, loss={total_loss:.4f}", flush=True)
             self.batch_count += 1
             ema_loss = (
                 0.98 * ema_loss + 0.02 * self.current_loss
@@ -760,8 +811,11 @@ class TTSTrainer(BaseTrainer):
 
     def train_loop(self):
         r"""Training loop. The public entry of training process."""
+        print("[DEBUG train_loop] Entered train_loop()", flush=True)
         # Wait everyone to prepare before we move on
+        print("[DEBUG train_loop] Before first wait_for_everyone()", flush=True)
         self.accelerator.wait_for_everyone()
+        print("[DEBUG train_loop] After first wait_for_everyone()", flush=True)
         # dump config file
         # if self.accelerator.is_main_process:
         #     self._dump_cfg(self.config_save_path)
@@ -769,15 +823,22 @@ class TTSTrainer(BaseTrainer):
         # self.optimizer.zero_grad()
 
         # Wait to ensure good to go
+        print("[DEBUG train_loop] Before second wait_for_everyone()", flush=True)
         self.accelerator.wait_for_everyone()
+        print("[DEBUG train_loop] After second wait_for_everyone(), entering while loop", flush=True)
+        print(f"[DEBUG train_loop] self.epoch={self.epoch}, self.max_epoch={self.max_epoch}", flush=True)
         while self.epoch < self.max_epoch:
+            print(f"[DEBUG train_loop] While loop iteration - epoch={self.epoch}", flush=True)
             if self.accelerator.is_main_process:
+                print(f"[DEBUG train_loop] Main process - logging epoch {self.epoch}", flush=True)
                 self.logger.info("\n")
                 self.logger.info("-" * 32)
                 self.logger.info("Epoch {}: ".format(self.epoch))
 
             # Do training & validating epoch
+            print(f"[DEBUG train_loop] Calling _train_epoch()", flush=True)
             train_total_loss, train_losses = self._train_epoch()
+            print(f"[DEBUG train_loop] _train_epoch() completed, loss={train_total_loss}", flush=True)
             if isinstance(train_losses, dict):
                 for key, loss in train_losses.items():
                     if self.accelerator.is_main_process:

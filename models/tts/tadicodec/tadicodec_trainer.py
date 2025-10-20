@@ -194,25 +194,55 @@ class TadiCodecTrainer(TTSTrainer):
                 )
 
         # Resume or Finetune
+        import sys
+        print("[DEBUG] Checkpoint loading section started", flush=True)
+        sys.stdout.flush()
+        print(f"[DEBUG] args.resume={args.resume}, args.checkpoint_path={args.checkpoint_path}", flush=True)
+        sys.stdout.flush()
         try:
             with self.accelerator.main_process_first():
-                if args.resume:
-                    ## Automatically resume according to the current exprimental name
-                    print(
-                        "Automatically resuming from latest checkpoint in {}...".format(
-                            self.checkpoint_dir
+                if args.resume or args.checkpoint_path:
+                    print("[DEBUG] Entering checkpoint loading block", flush=True)
+                    ## Load checkpoint for resume or finetune
+                    if args.resume:
+                        print(
+                            "Automatically resuming from latest checkpoint in {}...".format(
+                                self.checkpoint_dir
+                            ), flush=True
                         )
-                    )
-                    start = time.monotonic_ns()
-                    ckpt_path = self._load_model(
-                        checkpoint_dir=self.checkpoint_dir, resume_type=args.resume_type
-                    )
-                    end = time.monotonic_ns()
-                    print(
-                        f"Resuming from checkpoint done in {(end - start) / 1e6:.2f}ms"
-                    )
-        except:
-            print("Resume failed")
+                        start = time.monotonic_ns()
+                        ckpt_path = self._load_model(
+                            checkpoint_dir=self.checkpoint_dir, resume_type=args.resume_type
+                        )
+                        end = time.monotonic_ns()
+                        print(
+                            f"Resuming from checkpoint done in {(end - start) / 1e6:.2f}ms", flush=True
+                        )
+                    elif args.checkpoint_path:
+                        print("[DEBUG] Loading checkpoint for finetune", flush=True)
+                        print(
+                            "Loading checkpoint from {} for {}...".format(
+                                args.checkpoint_path, args.resume_type
+                            ), flush=True
+                        )
+                        start = time.monotonic_ns()
+                        ckpt_path = self._load_model(
+                            checkpoint_path=args.checkpoint_path, resume_type=args.resume_type
+                        )
+                        end = time.monotonic_ns()
+                        print(
+                            f"Loading checkpoint done in {(end - start) / 1e6:.2f}ms", flush=True
+                        )
+                        print("[DEBUG] Checkpoint loading completed", flush=True)
+                else:
+                    print("[DEBUG] No checkpoint loading - starting from scratch", flush=True)
+        except Exception as e:
+            print(f"Checkpoint loading failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+        print("[DEBUG] Checkpoint loading section finished", flush=True)
+        print("[DEBUG] About to call train_loop()", flush=True)
 
         # save config file path
         self.config_save_path = os.path.join(self.exp_dir, "args.json")
@@ -267,7 +297,31 @@ class TadiCodecTrainer(TTSTrainer):
         return mel_feature
 
     def _build_dataset(self):
-        return TadiCodecDataset, TadiCodecCollator
+        # 日本語データ拡張を使用するか確認
+        use_japanese_augmentation = False
+        if hasattr(self.cfg.preprocess, "data_augment"):
+            data_augment_list = self.cfg.preprocess.data_augment
+            if isinstance(data_augment_list, list) and "japanese" in data_augment_list:
+                use_japanese_augmentation = True
+
+        # 事前計算メルを使用するか確認
+        use_precomputed_mel = getattr(self.cfg.preprocess, "use_precomputed_mel", False)
+
+        # データセットクラスを選択
+        if use_precomputed_mel:
+            from models.tts.tadicodec.tadicodec_dataset_precomputed import (
+                TadiCodecPrecomputedDataset,
+                TadiCodecPrecomputedCollator,
+            )
+            return TadiCodecPrecomputedDataset, TadiCodecPrecomputedCollator
+        elif use_japanese_augmentation:
+            from models.tts.tadicodec.tadicodec_dataset_japanese import (
+                TadiCodecJapaneseDataset,
+                TadiCodecJapaneseCollator,
+            )
+            return TadiCodecJapaneseDataset, TadiCodecJapaneseCollator
+        else:
+            return TadiCodecDataset, TadiCodecCollator
 
     def _train_step(self, batch):
         train_losses = {}
@@ -313,7 +367,11 @@ class TadiCodecTrainer(TTSTrainer):
         #         ]
         # ############################################################################
 
-        mel_feat = self._extract_mel_feature(speech)  # [B, T, d]
+        # 事前計算メルを使用する場合はバッチから取得、そうでない場合は計算
+        if "precomputed_mel" in batch and batch["precomputed_mel"] is not None:
+            mel_feat = batch["precomputed_mel"]  # [B, T, d]
+        else:
+            mel_feat = self._extract_mel_feature(speech)  # [B, T, d]
 
         seq_len = x_mask.shape[1]
         if mel_feat is not None:

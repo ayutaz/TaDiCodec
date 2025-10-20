@@ -1,6 +1,6 @@
 import argparse
 import torch
-from models.tts.tadicodec.tadicodec_trainer import TadicodecTrainer
+from models.tts.tadicodec.tadicodec_trainer import TadiCodecTrainer
 
 
 from utils.util import load_config
@@ -8,7 +8,7 @@ from utils.util import load_config
 
 def build_trainer(args, cfg):
     supported_trainer = {
-        "Tadicodec": TadicodecTrainer,
+        "TaDiCodec": TadiCodecTrainer,
     }
 
     trainer_class = supported_trainer[cfg.model_type]
@@ -96,10 +96,14 @@ def main():
     cuda_relevant()
 
     # Build trainer
+    print("[DEBUG] Building trainer...", flush=True)
     trainer = build_trainer(args, cfg)
+    print("[DEBUG] Trainer built successfully", flush=True)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+    print("[DEBUG] Calling train_loop()...", flush=True)
     trainer.train_loop()
+    print("[DEBUG] train_loop() completed", flush=True)
 
 
 if __name__ == "__main__":

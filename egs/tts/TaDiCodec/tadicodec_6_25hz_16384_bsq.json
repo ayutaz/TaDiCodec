@@ -1,5 +1,5 @@
 {
-    "model_type": "TasCodec",
+    "model_type": "TaDiCodec",
     "dataset": ["emilia"],
     "preprocess": {
         "hop_size": 480,

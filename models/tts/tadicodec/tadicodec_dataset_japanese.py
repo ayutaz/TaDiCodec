@@ -92,7 +92,7 @@ class TadiCodecJapaneseDataset(BaseDataset):
         else:
             logger.info("Japanese data augmentation disabled.")
 
-    def _get_single_feature(self, speech, text, language):
+    def _get_single_feature(self, speech, text, language, idx=None):
         """
         音声とテキストから特徴を抽出（データ拡張対応版）
 
@@ -100,6 +100,7 @@ class TadiCodecJapaneseDataset(BaseDataset):
             speech: 音声データ
             text: テキスト
             language: 言語コード
+            idx: サンプルインデックス（テキストトークンキャッシュ用）
 
         Returns:
             特徴辞書
@@ -114,7 +115,7 @@ class TadiCodecJapaneseDataset(BaseDataset):
             )
 
         # 親クラスの特徴抽出を呼び出す
-        return super()._get_single_feature(speech, text, language)
+        return super()._get_single_feature(speech, text, language, idx=idx)
 
 
 class TadiCodecJapaneseCollator(BaseCollator):

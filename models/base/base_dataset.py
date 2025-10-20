@@ -142,6 +142,24 @@ class BaseDataset(torch.utils.data.Dataset):
             tokenizer_path = "./ckpt/TaDiCodec/text_tokenizer"
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
+        # テキストトークンキャッシュの読み込み（オプション）
+        self.use_text_tokens_cache = getattr(self.cfg.preprocess, "use_precomputed_text_tokens", False)
+        self.text_tokens_cache = None
+        if self.use_text_tokens_cache:
+            text_tokens_cache_path = getattr(
+                self.cfg.preprocess,
+                "text_tokens_cache_path",
+                os.path.join(self.cache_folder, "text_tokens_cache.pkl")
+            )
+            if os.path.exists(text_tokens_cache_path):
+                logger.info(f"Loading precomputed text tokens from {text_tokens_cache_path}")
+                with open(text_tokens_cache_path, "rb") as f:
+                    self.text_tokens_cache = pickle.load(f)
+                logger.info(f"Loaded {len(self.text_tokens_cache)} precomputed text tokens")
+            else:
+                logger.warning(f"Text tokens cache not found at {text_tokens_cache_path}")
+                logger.warning("Will fall back to on-the-fly tokenization")
+
         self.num_frame_indices = np.array(
             sorted(
                 range(len(self.index2num_frames)),
@@ -226,7 +244,7 @@ class BaseDataset(torch.utils.data.Dataset):
         del position
         return self.__getitem__(random_index)
 
-    def _get_single_feature(self, speech, text, language):
+    def _get_single_feature(self, speech, text, language, idx=None):
 
         single_feature = dict()
 
@@ -234,7 +252,11 @@ class BaseDataset(torch.utils.data.Dataset):
 
         lang_id = self.lang2id[language]
 
-        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        # テキストトークンキャッシュを優先使用
+        if self.text_tokens_cache is not None and idx is not None and idx in self.text_tokens_cache:
+            text_ids = self.text_tokens_cache[idx]
+        else:
+            text_ids = self.tokenizer.encode(text, add_special_tokens=False)
         text_mask = [1] * len(text_ids)
 
         single_feature.update(
@@ -276,7 +298,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 text = meta["text"]
                 language = meta["language"]
 
-                single_feature = self._get_single_feature(speech, text, language)
+                single_feature = self._get_single_feature(speech, text, language, idx=idx)
 
                 if len(single_feature["text_ids"]) > 512:
                     logger.info("Input ids too long. Get another.")

@@ -1,6 +1,10 @@
 {
-  "base_config": "egs/tts/TaDiCodec/tadicodec_6_25hz_16384_bsq.json",
+  "model_type": "TaDiCodec",
   "exp_name": "TaDiCodec_Japanese_Finetune",
+  "log_dir": "./logs",
+  "dataset": [
+    "jvs_emilia"
+  ],
   "preprocess": {
     "sample_rate": 24000,
     "hop_size": 480,
@@ -14,90 +18,124 @@
     "mel_var": 1.0,
     "min_dur": 1,
     "max_dur": 40,
+    "use_text": true,
+    "use_mel_feat": true,
     "tokenizer_path": "./ckpt/TaDiCodec_Japanese_Full/text_tokenizer",
-    "mnt_path": "./",
-    "cache_folder": "./cache/japanese",
+    "mnt_path": "./data/jvs_emilia/JA",
+    "cache_folder": "./cache/jvs_emilia",
     "use_json_path_cache": true,
     "use_lang_offset": false,
-    "data_augment": ["japanese"],
+    "use_precomputed_mel": true,
+    "mel_cache_dir": "./cache/jvs_emilia/mel_augmented",
+    "use_multi_version_mel": true,
+    "use_precomputed_text_tokens": true,
+    "text_tokens_cache_path": "./cache/jvs_emilia/text_tokens_cache.pkl",
+    "data_augment": [
+      "japanese"
+    ],
     "use_pitch_shift": true,
     "use_speed_perturb": true,
     "use_accent_augment": true,
     "use_code_switch": true,
-    "pitch_shift_range": [-4.0, 4.0],
-    "speed_perturb_range": [0.9, 1.1],
+    "pitch_shift_range": [
+      -4.0,
+      4.0
+    ],
+    "speed_perturb_range": [
+      0.9,
+      1.1
+    ],
     "augment_prob": 0.5
   },
   "model": {
     "tadicodec": {
+      "mel_dim": 128,
+      "in_dim": 128,
       "hidden_size": 1024,
-      "vq_emb_dim": 14,
+      "encoder_num_layers": 8,
+      "decoder_num_layers": 16,
+      "num_heads": 16,
+      "cond_drop_p": 0.2,
+      "context_drop_p": 0.2,
       "down_sample_factor": 8,
-      "n_codes": 16384,
-      "n_heads": 16,
-      "head_dim": 64,
-      "num_encoder_layers": 8,
-      "num_decoder_layers": 16,
+      "vq_emb_dim": 14,
       "use_text_cond": true,
       "text_vocab_size": 33844,
-      "cond_drop_p": 0.2,
-      "sigma": 1e-5,
-      "bsq_quantizer": {
-        "dim": 14,
-        "num_heads": 1,
-        "codebook_size": 16384,
-        "proj_factor": 1,
-        "commitment_loss_weight": 1.0,
-        "entropy_loss_weight": 0.1,
-        "entropy_loss_weight_gamma": 0.05
-      }
+      "cond_dim": 1024,
+      "cond_scale_factor": 1,
+      "sigma": 1e-05,
+      "time_scheduler": "linear",
+      "vq_type": "bsq"
+    },
+    "vocos": {
+      "input_channels": 128,
+      "dim": 1024,
+      "intermediate_dim": 4096,
+      "num_layers": 30,
+      "n_fft": 1920,
+      "hop_size": 480,
+      "padding": "same"
     }
   },
   "train": {
+    "max_epoch": 0,
+    "use_dynamic_batchsize": false,
     "batch_size": 8,
-    "gradient_accumulation_step": 4,
+    "gradient_accumulation_step": 8,
     "max_steps": 100000,
-    "save_checkpoint_stride": 5000,
+    "total_training_steps": 100000,
+    "num_train_steps": 100000,
+    "epochs": 5000,
     "checkpoints_path": "./ckpt",
-    "keep_last": 5,
-    "run_eval": true,
-    "adamw": {
-      "lr": 5e-5,
-      "adam_b1": 0.9,
-      "adam_b2": 0.999,
-      "adam_eps": 1e-8,
-      "weight_decay": 0.0
+    "save_checkpoint_stride": [
+      5000
+    ],
+    "save_checkpoints_steps": 5000,
+    "save_summary_steps": 500,
+    "valid_interval": 2000,
+    "keep_checkpoint_max": 100,
+    "keep_last": [
+      5
+    ],
+    "run_eval": [
+      true
+    ],
+    "adam": {
+      "lr": 5e-05
     },
     "lr_scheduler": {
       "warmup_steps": 5000,
-      "min_lr": 1e-6
+      "min_lr": 1e-06
     },
+    "lr_warmup_steps": 5000,
     "tracker": [
-      "tensorboard",
-      "wandb"
+      "tensorboard"
     ],
     "max_grad_norm": 1.0,
-    "mixed_precision": "fp16",
-    "seed": 42
+    "mixed_precision": "bf16",
+    "seed": 42,
+    "random_seed": 42,
+    "ddp": false,
+    "dataloader": {
+      "num_worker": 0,
+      "pin_memory": true
+    },
+    "use_emilia_dataset": true
   },
-  "dataset": [
-    "jvs",
-    "jsut"
-  ],
   "dataset_path": {
-    "jvs": "/path/to/jvs_ver1",
-    "jsut": "/path/to/jsut_ver1.1"
+    "jvs_emilia": "./data/jvs_emilia/JA"
   },
   "dataset_config": {
-    "jvs": {
-      "split_ratio": [0.98, 0.01, 0.01],
-      "languages": ["ja"],
+    "jvs_emilia": {
+      "split_ratio": [
+        0.98,
+        0.01,
+        0.01
+      ],
+      "languages": [
+        "ja"
+      ],
       "use_speaker_id": true
-    },
-    "jsut": {
-      "split_ratio": [0.98, 0.01, 0.01],
-      "languages": ["ja"],
-      "use_speaker_id": false
     }
   }
 }
