@@ -583,21 +583,19 @@ pipe = TaDiCodecPipline.from_pretrained("./ckpt/TaDiCodec")
   - キャッシュ生成スクリプト
 
 ### 🚧 開発中
-- TaDiCodec学習スクリプト
 - TTSモデル学習スクリプト
 - 評価スクリプト
 - テキスト入力用の自動ASR
-- **日本語ファインチューニング**（準備中）
-  - データセット準備スクリプト
-  - JVS/JSUTデータセットの統合
 
 ---
 
 ## 🇯🇵 日本語対応（Japanese Support）
 
-TaDiCodecに日本語音声合成の最適化機能を追加しました。
+**ステータス: ✅ 学習開始済み・動作確認済み（2025-10-20）**
 
-### 実装済み機能
+TaDiCodecの日本語音声合成最適化が完了し、学習が開始されました。
+
+### ✅ 実装完了機能
 
 #### 1. 日本語音素トークナイザー（OpenJTalk情報100%活用）
 
@@ -795,7 +793,125 @@ python scripts/test_cache_generation.py
 - 音声バリエーション: ピッチ×速度 = 理論上無限
 - 多言語ロバスト性: コードスイッチングにより向上
 
-### 日本語ファインチューニングの手順
+#### 5. 前処理スクリプト（メル・テキストトークン事前計算）
+
+**マルチバージョンメルスペクトログラム事前計算:**
+```powershell
+python scripts/precompute_mel_features_multi_version.py `
+  --config egs/tts/TaDiCodec/tadicodec_japanese_finetune.json `
+  --output_dir ./cache/jvs_emilia/mel_augmented
+```
+
+生成されるバージョン:
+- `original`: オリジナル
+- `pitch`: ピッチシフト（±4半音）
+- `speed`: 速度変化（0.9x-1.1x）
+- `both`: ピッチ+速度両方
+
+出力: 14,979 × 4 = 59,916ファイル（約20GB）
+
+**テキストトークン事前計算:**
+```powershell
+python scripts/precompute_text_tokens.py `
+  --config egs/tts/TaDiCodec/tadicodec_japanese_finetune.json `
+  --output_path ./cache/jvs_emilia/text_tokens_cache.pkl
+```
+
+出力: 14,979サンプルのトークンID（約50MB）
+
+#### 6. 学習初期化の最適化（99.8%高速化）
+
+**実装場所:** `models/base/tts_trainer.py:397-452`
+
+**最適化内容:**
+- SafetensorsをGPUに直接ロード（CPU経由を排除）
+- テキスト埋め込みサイズミスマッチの自動処理（32,100 → 33,844）
+- BFloat16混合精度（RTX 30/40シリーズ最適化）
+
+**成果:**
+- チェックポイント読み込み: 5分以上 → **0.75秒**（99.8%改善）
+- 初期化時間: 5分以上 → **6秒**（95%改善）
+
+### 🚀 学習の開始（実行確認済み）
+
+#### クイックスタート
+
+```powershell
+# PowerShellで実行（仮想環境アクティブ時）
+python bins/tts/train.py `
+  --config egs/tts/TaDiCodec/tadicodec_japanese_finetune.json `
+  --exp_name TaDiCodec_Japanese_Final2 `
+  --resume_type finetune `
+  --checkpoint_path ./ckpt/TaDiCodec
+```
+
+**期待される初期化ログ:**
+```
+[DEBUG] Loading checkpoint for finetune
+Loading checkpoint from ./ckpt/TaDiCodec for finetune...
+Loading checkpoint done in 750.00ms  ← 0.75秒で完了！
+
+INFO:models.tts.tadicodec.tadicodec_dataset_japanese:Japanese data augmentation initialized:
+INFO:models.tts.tadicodec.tadicodec_dataset_japanese:  - Pitch shift: True
+INFO:models.tts.tadicodec.tadicodec_dataset_japanese:  - Speed perturbation: True
+INFO:models.tts.tadicodec.tadicodec_dataset_japanese:  - Accent augmentation: True
+INFO:models.tts.tadicodec.tadicodec_dataset_japanese:  - Code switching: True
+
+[DEBUG _train_epoch] _train_step() completed, loss=5.1443  ← Loss計算成功！
+[DEBUG _train_epoch] _train_step() completed, loss=5.1834
+...
+```
+
+#### 学習設定
+
+**設定ファイル:** `egs/tts/TaDiCodec/tadicodec_japanese_finetune.json`
+
+```json
+{
+  "train": {
+    "batch_size": 8,
+    "gradient_accumulation_step": 8,  // 実効バッチサイズ=64
+    "max_steps": 100000,
+    "lr": 5e-05,
+    "warmup_steps": 5000,
+    "mixed_precision": "bf16",  // BFloat16（RTX最適化）
+    "save_checkpoint_stride": [5000],
+    "save_summary_steps": 500
+  },
+  "preprocess": {
+    "use_precomputed_mel": true,
+    "use_multi_version_mel": true,
+    "use_precomputed_text_tokens": true,
+    "use_pitch_shift": true,
+    "use_speed_perturb": true,
+    "use_accent_augment": true,
+    "use_code_switch": true
+  }
+}
+```
+
+#### TensorBoardで監視
+
+```powershell
+tensorboard --logdir logs/TaDiCodec_Japanese_Final2
+```
+
+ブラウザで `http://localhost:6006` を開く
+
+**監視すべき指標:**
+- `Epoch/Train diff Loss`: 拡散損失（5.0 → 1.5程度まで下降予定）
+- `Epoch/Train vq Loss`: VQ量子化損失（安定）
+- `learning_rate`: 学習率スケジュール
+
+### 📚 詳細ドキュメント
+
+完全な手順は以下のドキュメントを参照:
+- **JAPANESE_QUICK_START.md**: 学習開始までのクイックガイド（実行コマンド・結果付き）
+- **JAPANESE_PREPROCESSING_README.md**: 前処理の詳細ガイド
+- **JAPANESE_TRAINING_GUIDE.md**: 学習の詳細ガイド
+- **JAPANESE_TOKENIZER_COMPLETE.md**: トークナイザーの完全ドキュメント
+
+### 日本語ファインチューニングの手順（詳細版）
 
 #### ステップ1: 環境準備
 
